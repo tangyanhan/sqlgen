@@ -1,5 +1,5 @@
 # sqlgen
-==========
+
 package for generating SQL statements in a chain style. The SQL statements can be used by Go ORM ```sqlx``` directly.
 
 ### Example
@@ -31,7 +31,7 @@ func insertRecord(db *sqlx.DB)
 
 #### Tips
 
-If a structed is embeded, all of its fields can be expanded into sql using ```InsertStruct``` or ```UpdateStruct```.
+If a structed is embeded, simply add a tag like ```json:","```,  all of its fields can be expanded into sql using ```InsertStruct``` or ```UpdateStruct```.
 
 ```go
 type Info struct {
