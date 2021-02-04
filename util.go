@@ -23,6 +23,8 @@ type Builder struct {
 	dbTag string
 
 	isWhereAdded bool
+
+	mirror *Builder // a mirror that accepts same writes as count(*) convenience
 }
 
 // DollarArgFunc ArgFunc for postgres
@@ -49,23 +51,59 @@ func NewDefaultBuilder() *Builder {
 }
 
 // Raw simply add SQL
-func (b *Builder) Raw(raw string) *Builder {
-	b.b.WriteString(raw)
+func (b *Builder) Raw(raw string, args ...interface{}) *Builder {
+	b.writeString(raw)
+	for _, arg := range args {
+		b.addArg(arg)
+	}
 	return b
 }
 
 // Select start select statement
 func (b *Builder) Select(columns ...string) *Builder {
-	b.b.WriteString("SELECT ")
-	b.b.WriteString(strings.Join(columns, ","))
+	b.writeString("SELECT ")
+	for i, v := range columns {
+		columns[i] = v
+	}
+	b.writeString(strings.Join(columns, ","))
+	return b
+}
+
+// SelectStruct select struct
+func (b *Builder) SelectStruct(v interface{}, except ...string) *Builder {
+	exceptMap := make(map[string]bool)
+	for _, e := range except {
+		exceptMap[e] = true
+	}
+
+	cols, _ := reflectColumnValues(v, b.dbTag)
+	var selected []string
+	for _, col := range cols {
+		if exceptMap[col] {
+			continue
+		}
+		selected = append(selected, col)
+	}
+
+	b.writeString("SELECT ")
+	b.writeString(strings.Join(selected, ","))
 	return b
 }
 
 // From add from statement
 func (b *Builder) From(tables ...string) *Builder {
-	b.b.WriteString(" FROM ")
-	b.b.WriteString(strings.Join(tables, ","))
+	b.writeString(" FROM ")
+	b.writeString(strings.Join(tables, ","))
 	return b
+}
+
+func (b *Builder) writeWhere() {
+	if !b.isWhereAdded {
+		b.writeString(" WHERE ")
+		b.isWhereAdded = true
+	} else {
+		b.writeString(" AND ")
+	}
 }
 
 // Where add where statement and condition triples.
@@ -79,12 +117,7 @@ func (b *Builder) Where(condTriples ...interface{}) *Builder {
 	if len(condTriples)%3 != 0 {
 		panic(fmt.Sprintf("condition triples has incorrect length:%d", len(condTriples)))
 	}
-	if !b.isWhereAdded {
-		b.b.WriteString(" WHERE ")
-		b.isWhereAdded = true
-	} else {
-		b.b.WriteString(" AND ")
-	}
+	b.writeWhere()
 
 	tripleNum := len(condTriples) / 3
 	for i := 0; i < tripleNum; i++ {
@@ -92,14 +125,46 @@ func (b *Builder) Where(condTriples ...interface{}) *Builder {
 		if col == "" || op == "" {
 			panic(fmt.Sprintf("invalid column name or operator: %v%v", condTriples[i*3], condTriples[i*3+1]))
 		}
-		b.args = append(b.args, condTriples[i*3+2])
-		b.b.WriteString(col)
-		b.b.WriteString(op)
-		b.b.WriteString(b.argFn(len(b.args)))
-		if i+1 != tripleNum {
-			b.b.WriteRune(' ')
+		if i != 0 {
+			b.writeString(" AND ")
 		}
+		b.addArg(condTriples[i*3+2])
+		b.writeString(colName(col))
+		b.writeString(op)
+		b.writeString(b.argFn(len(b.args)))
 	}
+	return b
+}
+
+// Where add where statement and condition triples.
+// e.g. WHERE a=1 OR b=2
+// The condition above can be splitted into a condition triple ["a", "=", 1, "b", "=", 2]
+func (b *Builder) WhereOr(condTriples ...interface{}) *Builder {
+	// No conditions, skip
+	if len(condTriples) == 0 {
+		return b
+	}
+	if len(condTriples)%3 != 0 {
+		panic(fmt.Sprintf("condition triples has incorrect length:%d", len(condTriples)))
+	}
+	b.writeWhere()
+
+	tripleNum := len(condTriples) / 3
+	b.writeRune('(')
+	for i := 0; i < tripleNum; i++ {
+		col, op := condTriples[i*3].(string), condTriples[i*3+1].(string)
+		if col == "" || op == "" {
+			panic(fmt.Sprintf("invalid column name or operator: %v%v", condTriples[i*3], condTriples[i*3+1]))
+		}
+		if i != 0 {
+			b.writeString(" OR ")
+		}
+		b.addArg(condTriples[i*3+2])
+		b.writeString(colName(col))
+		b.writeString(op)
+		b.writeString(b.argFn(len(b.args)))
+	}
+	b.writeRune(')')
 	return b
 }
 
@@ -112,20 +177,20 @@ func (b *Builder) Update(table string, sets ...interface{}) *Builder {
 	if len(sets)%2 != 0 {
 		panic(fmt.Sprintf("update sets has incorrect length:%d", len(sets)))
 	}
-	b.b.WriteString("UPDATE " + table + " SET ")
+	b.writeString("UPDATE " + table + " SET ")
 	setNum := len(sets) / 2
 	for i := 0; i < setNum; i++ {
 		col, ok := sets[i*2].(string)
 		if !ok {
 			panic(fmt.Sprintf("invalid column name: %v", sets[i*2]))
 		}
-		b.args = append(b.args, sets[i*2+1])
+		b.addArg(sets[i*2+1])
 
-		b.b.WriteString(col)
-		b.b.WriteString("=")
-		b.b.WriteString(b.argFn(len(b.args)))
+		b.writeString(colName(col))
+		b.writeString("=")
+		b.writeString(b.argFn(len(b.args)))
 		if i != setNum-1 {
-			b.b.WriteRune(',')
+			b.writeRune(',')
 		}
 	}
 	return b
@@ -140,7 +205,7 @@ func (b *Builder) Insert(table string, sets ...interface{}) *Builder {
 	if len(sets)%2 != 0 {
 		panic(fmt.Sprintf("insert sets has incorrect length:%d", len(sets)))
 	}
-	b.b.WriteString("INSERT INTO " + table)
+	b.writeString("INSERT INTO " + table)
 	setNum := len(sets) / 2
 	var cols []string
 	var args []string
@@ -149,17 +214,17 @@ func (b *Builder) Insert(table string, sets ...interface{}) *Builder {
 		if !ok {
 			panic(fmt.Sprintf("invalid column name: %v", sets[i*2]))
 		}
-		cols = append(cols, col)
+		cols = append(cols, colName(col))
 
-		b.args = append(b.args, sets[i*2+1])
+		b.addArg(sets[i*2+1])
 		args = append(args, b.argFn(len(b.args)))
 	}
-	b.b.WriteRune('(')
-	b.b.WriteString(strings.Join(cols, ","))
-	b.b.WriteRune(')')
-	b.b.WriteString("VALUES(")
-	b.b.WriteString(strings.Join(args, ","))
-	b.b.WriteRune(')')
+	b.writeRune('(')
+	b.writeString(strings.Join(cols, ","))
+	b.writeRune(')')
+	b.writeString("VALUES(")
+	b.writeString(strings.Join(args, ","))
+	b.writeRune(')')
 	return b
 }
 
@@ -171,16 +236,16 @@ func (b *Builder) InsertStruct(table string, v interface{}) *Builder {
 	columns, args := reflectColumnValues(v, b.dbTag)
 	argPlaceholder := make([]string, len(args))
 	for i, arg := range args {
-		b.args = append(b.args, arg)
+		b.addArg(arg)
 		argPlaceholder[i] = b.argFn(len(b.args))
 	}
 
-	b.b.WriteString("INSERT INTO " + table + "(")
-	b.b.WriteString(strings.Join(columns, ","))
-	b.b.WriteRune(')')
-	b.b.WriteString("VALUES(")
-	b.b.WriteString(strings.Join(argPlaceholder, ","))
-	b.b.WriteRune(')')
+	b.writeString("INSERT INTO " + table + "(")
+	b.writeString(strings.Join(columns, ","))
+	b.writeRune(')')
+	b.writeString("VALUES(")
+	b.writeString(strings.Join(argPlaceholder, ","))
+	b.writeRune(')')
 	return b
 }
 
@@ -188,7 +253,7 @@ func (b *Builder) InsertStruct(table string, v interface{}) *Builder {
 func (b *Builder) UpdateStruct(table string, v interface{}, except ...string) *Builder {
 	exceptMap := make(map[string]bool)
 	for _, e := range except {
-		exceptMap[e] = true
+		exceptMap["`"+e+"`"] = true
 	}
 
 	cols, args := reflectColumnValues(v, b.dbTag)
@@ -197,12 +262,12 @@ func (b *Builder) UpdateStruct(table string, v interface{}, except ...string) *B
 		if exceptMap[col] {
 			continue
 		}
-		b.args = append(b.args, args[i])
+		b.addArg(args[i])
 		updates = append(updates, col+"="+b.argFn(len(b.args)))
 	}
 
-	b.b.WriteString("UPDATE " + table + " SET ")
-	b.b.WriteString(strings.Join(updates, ","))
+	b.writeString("UPDATE " + table + " SET ")
+	b.writeString(strings.Join(updates, ","))
 	return b
 }
 
@@ -248,15 +313,15 @@ fieldLoop:
 		}
 
 		args = append(args, argValue)
-		columns = append(columns, dbTv)
+		columns = append(columns, colName(dbTv))
 	}
 	return
 }
 
 // Delete start DELETE, forget adding where will be VERY DANGEROUS
 func (b *Builder) Delete(table string) *Builder {
-	b.b.WriteString("DELETE FROM ")
-	b.b.WriteString(table)
+	b.writeString("DELETE FROM ")
+	b.writeString(table)
 	return b
 }
 
@@ -265,8 +330,8 @@ func (b *Builder) OrderBy(statements ...string) *Builder {
 	if len(statements) == 0 {
 		return b
 	}
-	b.b.WriteString(" ORDER BY ")
-	b.b.WriteString(strings.Join(statements, ","))
+	b.writeString(" ORDER BY ")
+	b.writeString(strings.Join(statements, ","))
 	return b
 }
 
@@ -275,26 +340,74 @@ func (b *Builder) GroupBy(columns ...string) *Builder {
 	if len(columns) == 0 {
 		return b
 	}
-	b.b.WriteString(" GROUP BY ")
-	b.b.WriteString(strings.Join(columns, ","))
+	b.writeString(" GROUP BY ")
+	b.writeString(strings.Join(columns, ","))
 	return b
 }
 
 // Limit add limit
 func (b *Builder) Limit(n int) *Builder {
-	b.b.WriteString(" LIMIT ")
-	b.b.WriteString(strconv.Itoa(n))
+	b.addArg(n)
+	b.writeString(" LIMIT " + b.argFn(len(b.args)))
 	return b
 }
 
 // Offset add offset
 func (b *Builder) Offset(o int) *Builder {
-	b.b.WriteString(" OFFSET ")
-	b.b.WriteString(strconv.Itoa(o))
+	b.addArg(o)
+	b.writeString(" OFFSET " + b.argFn(len(b.args)))
 	return b
+}
+
+// In in struct
+func (b *Builder) In(col string, args ...interface{}) *Builder {
+	b.writeWhere()
+	b.writeString(colName(col))
+	b.writeString(" IN(")
+	placeholder := make([]string, len(args))
+	for i, arg := range args {
+		b.addArg(arg)
+		placeholder[i] = b.argFn(len(b.args))
+	}
+	b.writeString(strings.Join(placeholder, ","))
+	b.writeString(")")
+	return b
+}
+
+func (b *Builder) Mirror(m *Builder) *Builder {
+	b.mirror = m
+	return b
+}
+
+func (b *Builder) addArg(arg interface{}) {
+	b.args = append(b.args, arg)
+	if b.mirror != nil {
+		b.mirror.args = append(b.mirror.args, arg)
+	}
+}
+
+func (b *Builder) writeString(s string) {
+	b.b.WriteString(s)
+	if b.mirror != nil {
+		b.mirror.b.WriteString(s)
+	}
+}
+
+func (b *Builder) writeRune(r rune) {
+	b.b.WriteRune(r)
+	if b.mirror != nil {
+		b.mirror.b.WriteRune(r)
+	}
 }
 
 // Query return final SQL
 func (b *Builder) Query() (string, []interface{}) {
 	return b.b.String(), b.args
+}
+
+func colName(col string) string {
+	if col == "*" {
+		return col
+	}
+	return "`" + col + "`"
 }
